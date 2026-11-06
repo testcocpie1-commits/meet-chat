@@ -15,3 +15,14 @@ test('two real visitors chat, quote, report, and administrator moderates',async(
  await a.screenshot({path:'test-results/desktop.png',fullPage:true});await ca.close();await cb.close();
 });
 test('mobile layout and both Chinese locales',async({browser})=>{const c=await browser.newContext({viewport:{width:390,height:844}});const p=await c.newPage();await p.goto('/');await expect(p.locator('#join')).toBeVisible();expect(await p.evaluate(()=>document.documentElement.scrollWidth<=innerWidth)).toBe(true);await p.locator('#lang').click();await expect(p.locator('html')).toHaveAttribute('lang','zh-Hant');await expect(p.locator('#join')).toHaveText('開始遇見 →');await p.screenshot({path:'test-results/mobile.png',fullPage:true});await c.close();});
+test('expired session recovers by itself and closing the page ends the chat at once',async({browser})=>{
+ const ca=await browser.newContext(),cb=await browser.newContext(),a=await ca.newPage(),b=await cb.newPage();
+ await a.goto('/');await expect(a.locator('#online')).toContainText('在线');
+ await ca.clearCookies({name:'session'});await expect(a.locator('#error')).toContainText('连接已恢复',{timeout:5000});
+ await a.locator('#lang').click();await expect(a.locator('#error')).toContainText('連線已恢復');
+ await b.goto('/');for(const p of [a,b]){await p.locator('#consent').check();await p.locator('#phrase').fill('关闭测试');}
+ await b.locator('input[value=female]').check();await a.locator('#join').click();await b.locator('#join').click();
+ await expect(b.locator('#status')).toContainText('已连接');await a.close();
+ await expect(b.locator('#status')).toContainText('已离开',{timeout:5000});await expect(b.locator('#report')).toBeEnabled();
+ await ca.close();await cb.close();
+});
