@@ -8,6 +8,11 @@ mkdirSync(root+'data',{recursive:true});
 const db=new DatabaseSync(process.env.DB_PATH||root+'data/moderation.sqlite');
 db.exec('CREATE TABLE IF NOT EXISTS reports(id TEXT PRIMARY KEY,target TEXT,reason TEXT,evidence TEXT,status TEXT,created INTEGER); CREATE TABLE IF NOT EXISTS bans(target TEXT PRIMARY KEY,expires INTEGER)');
 const sessions=new Map(), admins=new Map(), attempts=new Map(), creations=new Map();
+// A session (and an open chat) is kept for SESSION_TIMEOUT_MINUTES without activity, default 60.
+// After AWAY_MS without polling a user counts as away: skipped by matching, and their chat partner is told.
+const SESSION_MS=Math.max(1,Number(process.env.SESSION_TIMEOUT_MINUTES)||60)*60000, AWAY_MS=90000;
+const away=s=>Date.now()-s.seen>AWAY_MS;
+export const internals={sessions,expire};
 // Behind a reverse proxy set TRUST_PROXY=true so the proxy-appended X-Forwarded-For entry is used instead of the proxy's own address.
 const clientIp=req=>process.env.TRUST_PROXY==='true'&&req.headers['x-forwarded-for']?req.headers['x-forwarded-for'].split(',').at(-1).trim():req.socket.remoteAddress;
 const secret=process.env.ADMIN_PASSWORD;
@@ -16,15 +21,15 @@ const hash=s=>createHash('sha256').update(s).digest('hex');
 const cookie=(req,name)=>req.headers.cookie?.split(';').map(x=>x.trim()).find(x=>x.startsWith(name+'='))?.slice(name.length+1);
 const banned=s=>!!db.prepare('SELECT 1 FROM bans WHERE target=? AND expires>?').get(s.device,Date.now());
 function leave(s){s.queued=false;if(s.peer){const p=sessions.get(s.peer);if(p){p.peer=null;p.state='ended';p.lastPeer=s.device;}s.peer=null;}s.lastPeer=null;s.state='idle';}
-function expire(){for(const [id,s] of sessions)if(Date.now()-s.seen>90000){leave(s);sessions.delete(id);}for(const [id,t]of admins)if(t<Date.now())admins.delete(id);for(const m of [attempts,creations])for(const[k,a]of m)if(a.until<Date.now())m.delete(k);}
+function expire(){for(const [id,s] of sessions)if(Date.now()-s.seen>SESSION_MS){leave(s);sessions.delete(id);}for(const [id,t]of admins)if(t<Date.now())admins.delete(id);for(const m of [attempts,creations])for(const[k,a]of m)if(a.until<Date.now())m.delete(k);}
 setInterval(expire,10000).unref();
 const compatible=(a,b)=>a.phrase===b.phrase&&(a.mode==='random'||a.gender!==b.gender)&&(b.mode==='random'||a.gender!==b.gender)&&a.device!==b.device&&!a.blocked.has(b.device)&&!b.blocked.has(a.device);
-function match(s){for(const p of sessions.values())if(p!==s&&p.queued&&!banned(p)&&compatible(s,p)){s.peer=p.id;p.peer=s.id;s.state=p.state='chat';s.queued=p.queued=false;s.messages=[];p.messages=[];s.chat=p.chat=token().slice(0,16);return;}s.queued=true;s.state='waiting';}
+function match(s){for(const p of sessions.values())if(p!==s&&p.queued&&!away(p)&&!banned(p)&&compatible(s,p)){s.peer=p.id;p.peer=s.id;s.state=p.state='chat';s.queued=p.queued=false;s.messages=[];p.messages=[];s.chat=p.chat=token().slice(0,16);return;}s.queued=true;s.state='waiting';}
 // Online/waiting counts are polled by every client; recount at most once per second instead of on every request.
 let counts={at:0,online:0,waiting:0};
-function stats(){if(Date.now()-counts.at>1000){let waiting=0;for(const x of sessions.values())if(x.queued)waiting++;counts={at:Date.now(),online:sessions.size,waiting};}return counts;}
+function stats(){if(Date.now()-counts.at>1000){let waiting=0;for(const x of sessions.values())if(x.queued&&!away(x))waiting++;counts={at:Date.now(),online:sessions.size,waiting};}return counts;}
 // With ?chat=<id>&since=<seq> matching the current chat, only newer messages are returned (delta:true); otherwise the full list.
-function view(s,url){const since=Number(url?.searchParams.get('since')),delta=!!url&&url.searchParams.get('chat')===s.chat&&Number.isInteger(since)&&since>=0;const {online,waiting}=stats();return {state:s.state,chat:s.chat,delta,messages:delta?s.messages.filter(m=>m.seq>since):s.messages,online,waiting};}
+function view(s,url){const since=Number(url?.searchParams.get('since')),delta=!!url&&url.searchParams.get('chat')===s.chat&&Number.isInteger(since)&&since>=0;const {online,waiting}=stats(),p=sessions.get(s.peer);return {state:s.state,chat:s.chat,peerAway:!!p&&away(p),delta,messages:delta?s.messages.filter(m=>m.seq>since):s.messages,online,waiting};}
 function push(x,m){x.messages.push({...m,seq:++x.seq});if(x.messages.length>100)x.messages=x.messages.slice(-100);}
 async function body(req){const chunks=[];let size=0;for await(const chunk of req){size+=chunk.length;if(size>16384)throw Object.assign(Error('内容过长'),{status:413});chunks.push(chunk);}const text=Buffer.concat(chunks).toString('utf8');return JSON.parse(text||'{}');}
 const equal=(a,b)=>{const x=Buffer.from(hash(a)),y=Buffer.from(hash(b));return timingSafeEqual(x,y);};
@@ -49,7 +54,7 @@ export const server=http.createServer(async(req,res)=>{
  if(url.pathname==='/api/admin/action'&&req.method==='POST'){const r=db.prepare('SELECT * FROM reports WHERE id=?').get(String(b.id));if(!r)return send(404,{error:'举报不存在'});if(!['ban','resolve','dismiss'].includes(b.action))return send(400,{error:'操作无效'});if(b.action==='ban'){db.prepare('INSERT OR REPLACE INTO bans VALUES(?,?)').run(r.target,Date.now()+86400000);for(const s of sessions.values())if(s.device===r.target)leave(s);}db.prepare('UPDATE reports SET status=? WHERE id=?').run(b.action,r.id);return send(200,{ok:true});}
  return send(404,{error:'找不到接口'});}
  if(url.pathname==='/api/session'&&req.method==='POST'){
- let s=sessions.get(cookie(req,'session'));if(!s){const ip=clientIp(req),c=creations.get(ip)?.until>Date.now()?creations.get(ip):{n:0,until:Date.now()+60000};if(c.n>=30)return send(429,{error:'操作太频繁，请稍后再试'});c.n++;creations.set(ip,c);if(sessions.size>=2000)return send(503,{error:'当前人数已满'});const raw=cookie(req,'device');const device=/^[a-f0-9]{64}$/.test(raw||'')?raw:token();s={id:token(),device:hash(device),seen:Date.now(),state:'idle',messages:[],seq:0,chat:token().slice(0,16),blocked:new Set(),peer:null,lastPeer:null,queued:false,last:0};sessions.set(s.id,s);res.setHeader('Set-Cookie',[`session=${s.id}; HttpOnly; SameSite=Strict; Path=/${process.env.COOKIE_SECURE==='true'?'; Secure':''}`,`device=${device}; HttpOnly; SameSite=Strict; Max-Age=31536000; Path=/${process.env.COOKIE_SECURE==='true'?'; Secure':''}`]);}s.seen=Date.now();return send(200,view(s));}
+ let s=sessions.get(cookie(req,'session'));if(!s){const ip=clientIp(req),c=creations.get(ip)?.until>Date.now()?creations.get(ip):{n:0,until:Date.now()+60000};if(c.n>=30)return send(429,{error:'操作太频繁，请稍后再试'});c.n++;creations.set(ip,c);if(sessions.size>=2000){let oldest=null;for(const x of sessions.values())if(!x.peer&&away(x)&&(!oldest||x.seen<oldest.seen))oldest=x;if(!oldest)return send(503,{error:'当前人数已满'});leave(oldest);sessions.delete(oldest.id);}const raw=cookie(req,'device');const device=/^[a-f0-9]{64}$/.test(raw||'')?raw:token();s={id:token(),device:hash(device),seen:Date.now(),state:'idle',messages:[],seq:0,chat:token().slice(0,16),blocked:new Set(),peer:null,lastPeer:null,queued:false,last:0};sessions.set(s.id,s);res.setHeader('Set-Cookie',[`session=${s.id}; HttpOnly; SameSite=Strict; Path=/${process.env.COOKIE_SECURE==='true'?'; Secure':''}`,`device=${device}; HttpOnly; SameSite=Strict; Max-Age=31536000; Path=/${process.env.COOKIE_SECURE==='true'?'; Secure':''}`]);}s.seen=Date.now();return send(200,view(s));}
  const s=sessions.get(cookie(req,'session'));if(!s)return send(401,{error:'会话已过期，请刷新页面'});s.seen=Date.now();if(banned(s)){leave(s);return send(403,{error:'当前设备已被限制使用'});}
  if(url.pathname==='/api/state'&&req.method==='GET')return send(200,view(s,url));
  if(req.method!=='POST')return send(405,{error:'请求方式无效'});
