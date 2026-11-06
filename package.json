@@ -1,0 +1,17 @@
+{
+  "name": "meet-chat",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "test": "node --test chat.test.js",
+    "test:browser": "playwright test"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.65.0"
+  }
+}
